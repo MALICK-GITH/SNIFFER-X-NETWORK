@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""SNIFFER-X-NETWORK: Termux-friendly PCAP/network diagnostics CLI.
+"""SNIFFER-X-NETWORK: interactive Termux-friendly network diagnostics.
 
-This V1 focuses on authorized/offline packet analysis. Live capture is exposed
-as a capability check because Android permissions differ between devices.
+The tool can still be used with command-line arguments, but launching it
+without arguments opens an interactive terminal menu so users do not need to
+remember commands.
+
+Live capture remains a capability check because Android capture permissions
+and mechanisms differ between devices.
 """
 
 import argparse
@@ -103,12 +107,12 @@ def print_packets(packets, limit=30):
             ports = f":{p['src_port']} -> :{p['dst_port']}"
         print(f"{i:>4}  {p['protocol']:<7} {p['src']}{ports} -> {p['dst']}  {p['length']} B")
     if len(packets) > limit:
-        print(f"... {len(packets) - limit} more packets (use --limit to change)")
+        print(f"... {len(packets) - limit} more packets")
 
 
 def print_stats(packets):
     s = stats(packets)
-    print("SNIFFER-X-NETWORK")
+    print("\nSNIFFER-X-NETWORK")
     print("=" * 56)
     print(f"Packets : {s['packets']}")
     print(f"Bytes   : {s['bytes']}")
@@ -129,7 +133,103 @@ def export_csv(packets, path):
     fields = ["src", "dst", "protocol", "src_port", "dst_port", "length"]
     with Path(path).open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader(); writer.writerows(packets)
+        writer.writeheader()
+        writer.writerows(packets)
+
+
+def resolve_target(target):
+    """Resolve a hostname without performing traffic interception."""
+    try:
+        infos = socket.getaddrinfo(target, None, type=socket.SOCK_STREAM)
+        addresses = sorted({item[4][0] for item in infos})
+    except socket.gaierror as exc:
+        print(f"\nImpossible de résoudre {target}: {exc}")
+        return
+    print(f"\nCible : {target}")
+    print("DNS / adresses résolues")
+    print("-" * 40)
+    for address in addresses:
+        print(f"  {address}")
+    print("\nCette fonction affiche uniquement la résolution DNS.")
+
+
+def interactive_pcap():
+    print("\n📦 ANALYSE PCAP")
+    path = input("Chemin du fichier PCAP : ").strip()
+    if not path:
+        print("Annulé.")
+        return
+    try:
+        packets = read_pcap(path)
+    except (OSError, ValueError) as exc:
+        print(f"Erreur : {exc}")
+        return
+
+    protocol = input("Protocole (TCP/UDP/ICMP/IPv6 ou Entrée=tous) : ").strip().upper() or None
+    host = input("IP à filtrer (ou Entrée=toutes) : ").strip() or None
+    port_text = input("Port à filtrer (ou Entrée=tous) : ").strip()
+    port = int(port_text) if port_text.isdigit() else None
+    limit_text = input("Nombre de paquets à afficher [30] : ").strip()
+    limit = int(limit_text) if limit_text.isdigit() else 30
+
+    packets = filter_packets(packets, protocol, host, port)
+    print_stats(packets)
+    print("\nPaquets:")
+    print_packets(packets, max(0, limit))
+
+    export = input("Exporter en JSON/CSV ? (json/csv/non) : ").strip().lower()
+    if export in ("json", "csv"):
+        output = input(f"Nom du fichier [{Path(path).stem}.{export}] : ").strip()
+        output = output or f"{Path(path).stem}.{export}"
+        try:
+            export_json(packets, output) if export == "json" else export_csv(packets, output)
+            print(f"✓ Export terminé : {output}")
+        except OSError as exc:
+            print(f"Erreur export : {exc}")
+
+
+def interactive_target():
+    print("\n🎯 CIBLE / DNS")
+    target = input("Domaine ou IP [mtn.ci] : ").strip() or "mtn.ci"
+    resolve_target(target)
+
+
+def interactive_live():
+    print("\n📡 MODE LIVE")
+    print("Backend de capture : dépendant de l'appareil")
+    print("Termux/Android peut nécessiter root ou un mécanisme de capture autorisé.")
+    print("SNIFFER-X-NETWORK ne contourne aucune protection ni permission.")
+    input("Appuie sur Entrée pour revenir au menu...")
+
+
+def interactive_menu():
+    while True:
+        print("\n" + "=" * 56)
+        print("        SNIFFER-X-NETWORK  v0.1")
+        print("      NETWORK DIAGNOSTICS • TERMUX")
+        print("=" * 56)
+        print("[1] 📦 Analyser un fichier PCAP")
+        print("[2] 🎯 Résoudre une cible (DNS/IP)")
+        print("[3] 📡 Vérifier le mode Live")
+        print("[4] ℹ️  Aide")
+        print("[0] 🚪 Quitter")
+        choice = input("\nChoix > ").strip()
+        if choice == "1":
+            interactive_pcap()
+        elif choice == "2":
+            interactive_target()
+        elif choice == "3":
+            interactive_live()
+        elif choice == "4":
+            print("\nConseil : utilise le menu pour éviter de mémoriser les commandes.")
+            print("Les analyses concernent uniquement des captures et réseaux que tu es autorisé à diagnostiquer.")
+            input("\nAppuie sur Entrée...")
+        elif choice == "0":
+            print("\nSNIFFER-X-NETWORK fermé. 👋")
+            return 0
+        else:
+            print("Choix invalide.")
+    return 0
 
 
 def build_parser():
@@ -149,6 +249,10 @@ def build_parser():
 
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        return interactive_menu()
     args = build_parser().parse_args(argv)
     if args.command == "live":
         print("Live capture backend: device-dependent")
@@ -158,11 +262,16 @@ def main(argv=None):
     try:
         packets = read_pcap(args.file)
     except (OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr); return 2
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     packets = filter_packets(packets, args.protocol, args.host, args.port)
-    print_stats(packets); print("\nPackets:"); print_packets(packets, max(0, args.limit))
-    if args.json_out: export_json(packets, args.json_out)
-    if args.csv_out: export_csv(packets, args.csv_out)
+    print_stats(packets)
+    print("\nPackets:")
+    print_packets(packets, max(0, args.limit))
+    if args.json_out:
+        export_json(packets, args.json_out)
+    if args.csv_out:
+        export_csv(packets, args.csv_out)
     return 0
 
 
