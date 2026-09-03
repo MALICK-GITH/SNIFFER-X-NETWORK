@@ -1,279 +1,160 @@
 #!/usr/bin/env python3
-"""SNIFFER-X-NETWORK: interactive Termux-friendly network diagnostics.
-
-The tool can still be used with command-line arguments, but launching it
-without arguments opens an interactive terminal menu so users do not need to
-remember commands.
-
-Live capture remains a capability check because Android capture permissions
-and mechanisms differ between devices.
+"""SNIFFER-X-NETWORK: interactive network and URL diagnostics for Termux.
+Use only on systems, domains and traffic you own or are authorized to test.
 """
-
-import argparse
-import csv
-import ipaddress
-import json
-import socket
-import struct
-import sys
+import argparse,csv,ipaddress,json,re,socket,ssl,struct,sys,urllib.parse,urllib.request
 from collections import Counter
 from pathlib import Path
 
-PCAP_MAGICS = {
-    b"\xd4\xc3\xb2\xa1": "<", b"\xa1\xb2\xc3\xd4": ">",
-    b"\x4d\x3c\xb2\xa1": "<", b"\xa1\xb2\x3c\x4d": ">",
-}
-ETHERNET = 1
-IPV4, IPV6 = 0x0800, 0x86DD
-TCP, UDP, ICMP = 6, 17, 1
-PROTOCOLS = {TCP: "TCP", UDP: "UDP", ICMP: "ICMP"}
+PCAP_MAGICS={b"\xd4\xc3\xb2\xa1":"<",b"\xa1\xb2\xc3\xd4":">",b"\x4d\x3c\xb2\xa1":"<",b"\xa1\xb2\x3c\x4d":">"}
+ETHERNET=1; IPV4=0x0800; IPV6=0x86DD; TCP=6; UDP=17; ICMP=1
+PROTOCOLS={TCP:"TCP",UDP:"UDP",ICMP:"ICMP"}
 
 
-def ip4(raw):
-    return socket.inet_ntoa(raw)
+def parse_ipv4(d):
+    if len(d)<20 or d[0]>>4!=4:return None
+    ihl=(d[0]&15)*4
+    if ihl<20 or len(d)<ihl:return None
+    proto=d[9]; p={"src":socket.inet_ntoa(d[12:16]),"dst":socket.inet_ntoa(d[16:20]),"protocol":PROTOCOLS.get(proto,f"IP/{proto}"),"src_port":None,"dst_port":None,"length":len(d)}
+    if proto in (TCP,UDP) and len(d)>=ihl+4:p["src_port"],p["dst_port"]=struct.unpack("!HH",d[ihl:ihl+4])
+    return p
 
 
-def parse_ipv4(data):
-    if len(data) < 20 or data[0] >> 4 != 4:
-        return None
-    ihl = (data[0] & 0x0F) * 4
-    if ihl < 20 or len(data) < ihl:
-        return None
-    proto = data[9]
-    result = {"src": ip4(data[12:16]), "dst": ip4(data[16:20]),
-              "protocol": PROTOCOLS.get(proto, f"IP/{proto}"),
-              "src_port": None, "dst_port": None, "length": len(data)}
-    if proto in (TCP, UDP) and len(data) >= ihl + 4:
-        result["src_port"], result["dst_port"] = struct.unpack("!HH", data[ihl:ihl + 4])
-    return result
-
-
-def parse_ipv6(data):
-    if len(data) < 40 or data[0] >> 4 != 6:
-        return None
-    src = str(ipaddress.IPv6Address(data[8:24]))
-    dst = str(ipaddress.IPv6Address(data[24:40]))
-    return {"src": src, "dst": dst, "protocol": "IPv6",
-            "src_port": None, "dst_port": None, "length": len(data)}
+def parse_ipv6(d):
+    if len(d)<40 or d[0]>>4!=6:return None
+    return {"src":str(ipaddress.IPv6Address(d[8:24])),"dst":str(ipaddress.IPv6Address(d[24:40])),"protocol":"IPv6","src_port":None,"dst_port":None,"length":len(d)}
 
 
 def read_pcap(path):
-    raw = Path(path).read_bytes()
-    if len(raw) < 24:
-        raise ValueError("PCAP file is too small")
-    magic = raw[:4]
-    if magic not in PCAP_MAGICS:
-        raise ValueError("Unsupported PCAP/byte order")
-    endian = PCAP_MAGICS[magic]
-    network = struct.unpack_from(endian + "I", raw, 20)[0]
-    if network != ETHERNET:
-        raise ValueError(f"Unsupported link type {network}; Ethernet PCAP required")
-    pos, packets = 24, []
-    while pos + 16 <= len(raw):
-        _sec, _usec, incl, _orig = struct.unpack_from(endian + "IIII", raw, pos)
-        pos += 16
-        if incl > len(raw) - pos:
-            break
-        frame = raw[pos:pos + incl]
-        pos += incl
-        if len(frame) < 14:
-            continue
-        ethertype = struct.unpack("!H", frame[12:14])[0]
-        payload = frame[14:]
-        packet = parse_ipv4(payload) if ethertype == IPV4 else parse_ipv6(payload) if ethertype == IPV6 else None
-        if packet:
-            packets.append(packet)
-    return packets
+    raw=Path(path).read_bytes()
+    if len(raw)<24 or raw[:4] not in PCAP_MAGICS:raise ValueError("Unsupported or invalid PCAP")
+    endian=PCAP_MAGICS[raw[:4]]
+    if struct.unpack_from(endian+"I",raw,20)[0]!=ETHERNET:raise ValueError("Only Ethernet PCAP is supported")
+    pos=24; out=[]
+    while pos+16<=len(raw):
+        _,_,incl,_=struct.unpack_from(endian+"IIII",raw,pos);pos+=16
+        if incl>len(raw)-pos:break
+        f=raw[pos:pos+incl];pos+=incl
+        if len(f)<14:continue
+        et=struct.unpack("!H",f[12:14])[0];d=f[14:]
+        p=parse_ipv4(d) if et==IPV4 else parse_ipv6(d) if et==IPV6 else None
+        if p:out.append(p)
+    return out
 
 
-def filter_packets(packets, protocol=None, host=None, port=None):
-    protocol = protocol.upper() if protocol else None
-    return [p for p in packets if
-            (not protocol or p["protocol"].upper() == protocol) and
-            (not host or p["src"] == host or p["dst"] == host) and
-            (not port or p["src_port"] == port or p["dst_port"] == port)]
+def filter_packets(ps,protocol=None,host=None,port=None):
+    protocol=protocol.upper() if protocol else None
+    return [p for p in ps if (not protocol or p["protocol"].upper()==protocol) and (not host or host in (p["src"],p["dst"])) and (not port or port in (p["src_port"],p["dst_port"]))]
 
 
-def stats(packets):
-    return {"packets": len(packets), "bytes": sum(p["length"] for p in packets),
-            "protocols": dict(Counter(p["protocol"] for p in packets)),
-            "top_hosts": Counter(x for p in packets for x in (p["src"], p["dst"])).most_common(10)}
+def stats(ps):return {"packets":len(ps),"bytes":sum(p["length"] for p in ps),"protocols":dict(Counter(p["protocol"] for p in ps)),"top_hosts":Counter(x for p in ps for x in (p["src"],p["dst"])).most_common(10)}
 
+def print_stats(ps):
+    s=stats(ps);print("\nPackets:",s["packets"],"  Bytes:",s["bytes"]);print("Protocols:")
+    for k,v in sorted(s["protocols"].items(),key=lambda x:-x[1]):print(f"  {k:<10}{v}")
+    print("Top hosts:")
+    for h,n in s["top_hosts"]:print(f"  {h:<40}{n}")
 
-def print_packets(packets, limit=30):
-    for i, p in enumerate(packets[:limit], 1):
-        ports = ""
-        if p["src_port"] is not None:
-            ports = f":{p['src_port']} -> :{p['dst_port']}"
-        print(f"{i:>4}  {p['protocol']:<7} {p['src']}{ports} -> {p['dst']}  {p['length']} B")
-    if len(packets) > limit:
-        print(f"... {len(packets) - limit} more packets")
+def print_packets(ps,limit=30):
+    for i,p in enumerate(ps[:limit],1):
+        ports=f":{p['src_port']} -> :{p['dst_port']}" if p["src_port"] is not None else ""
+        print(f"{i:>4} {p['protocol']:<7} {p['src']}{ports} -> {p['dst']} {p['length']} B")
 
-
-def print_stats(packets):
-    s = stats(packets)
-    print("\nSNIFFER-X-NETWORK")
-    print("=" * 56)
-    print(f"Packets : {s['packets']}")
-    print(f"Bytes   : {s['bytes']}")
-    print("Protocols:")
-    for proto, count in sorted(s["protocols"].items(), key=lambda x: (-x[1], x[0])):
-        print(f"  {proto:<10} {count}")
-    if s["top_hosts"]:
-        print("Top hosts:")
-        for host, count in s["top_hosts"]:
-            print(f"  {host:<39} {count}")
-
-
-def export_json(packets, path):
-    Path(path).write_text(json.dumps(packets, indent=2), encoding="utf-8")
-
-
-def export_csv(packets, path):
-    fields = ["src", "dst", "protocol", "src_port", "dst_port", "length"]
-    with Path(path).open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(packets)
-
+def normalize_url(t):return t if "://" in t else "https://"+t
 
 def resolve_target(target):
-    """Resolve a hostname without performing traffic interception."""
+    host=urllib.parse.urlparse(normalize_url(target)).hostname or target
+    print(f"\n🎯 TARGET: {host}")
     try:
-        infos = socket.getaddrinfo(target, None, type=socket.SOCK_STREAM)
-        addresses = sorted({item[4][0] for item in infos})
-    except socket.gaierror as exc:
-        print(f"\nImpossible de résoudre {target}: {exc}")
-        return
-    print(f"\nCible : {target}")
-    print("DNS / adresses résolues")
-    print("-" * 40)
-    for address in addresses:
-        print(f"  {address}")
-    print("\nCette fonction affiche uniquement la résolution DNS.")
+        infos=socket.getaddrinfo(host,None);ips=sorted({x[4][0] for x in infos})
+        print("\nDNS / IP:");[print("  "+x) for x in ips]
+    except socket.gaierror as e:print("DNS error:",e)
+    return host
 
-
-def interactive_pcap():
-    print("\n📦 ANALYSE PCAP")
-    path = input("Chemin du fichier PCAP : ").strip()
-    if not path:
-        print("Annulé.")
-        return
+def http_headers(target):
+    url=normalize_url(target);print("\n🌐 HTTP HEADERS:",url)
+    req=urllib.request.Request(url,headers={"User-Agent":"SNIFFER-X-NETWORK/0.2"},method="HEAD")
     try:
-        packets = read_pcap(path)
-    except (OSError, ValueError) as exc:
-        print(f"Erreur : {exc}")
-        return
+        with urllib.request.urlopen(req,timeout=8) as r:
+            print("Status:",r.status,r.reason)
+            for k,v in r.headers.items():print(f"  {k}: {v}")
+    except Exception as e:print("HTTP error:",e)
 
-    protocol = input("Protocole (TCP/UDP/ICMP/IPv6 ou Entrée=tous) : ").strip().upper() or None
-    host = input("IP à filtrer (ou Entrée=toutes) : ").strip() or None
-    port_text = input("Port à filtrer (ou Entrée=tous) : ").strip()
-    port = int(port_text) if port_text.isdigit() else None
-    limit_text = input("Nombre de paquets à afficher [30] : ").strip()
-    limit = int(limit_text) if limit_text.isdigit() else 30
+def tls_info(target):
+    u=urllib.parse.urlparse(normalize_url(target));host=u.hostname
+    if not host:return
+    port=u.port or 443
+    print(f"\n🔐 TLS: {host}:{port}")
+    try:
+        ctx=ssl.create_default_context()
+        with socket.create_connection((host,port),timeout=8) as s:
+            with ctx.wrap_socket(s,server_hostname=host) as t:
+                print("Version:",t.version());print("Cipher:",t.cipher()[0] if t.cipher() else "unknown")
+    except Exception as e:print("TLS error:",e)
 
-    packets = filter_packets(packets, protocol, host, port)
-    print_stats(packets)
-    print("\nPaquets:")
-    print_packets(packets, max(0, limit))
+def extract_links(target):
+    url=normalize_url(target);print("\n🔗 LINK EXTRACTOR:",url)
+    req=urllib.request.Request(url,headers={"User-Agent":"SNIFFER-X-NETWORK/0.2"})
+    try:
+        with urllib.request.urlopen(req,timeout=10) as r:
+            html=r.read(2*1024*1024).decode("utf-8","ignore");base=r.geturl()
+        links=[];seen=set()
+        for raw in re.findall(r'''(?:href|src)\s*=\s*[\"']([^\"']+)[\"']''',html,re.I):
+            x=urllib.parse.urljoin(base,raw)
+            if x.startswith(("http://","https://")) and x not in seen:seen.add(x);links.append(x)
+        print(f"Found: {len(links)} links")
+        for i,x in enumerate(links[:200],1):print(f"{i:>3}. {x}")
+    except Exception as e:print("Fetch error:",e)
 
-    export = input("Exporter en JSON/CSV ? (json/csv/non) : ").strip().lower()
-    if export in ("json", "csv"):
-        output = input(f"Nom du fichier [{Path(path).stem}.{export}] : ").strip()
-        output = output or f"{Path(path).stem}.{export}"
-        try:
-            export_json(packets, output) if export == "json" else export_csv(packets, output)
-            print(f"✓ Export terminé : {output}")
-        except OSError as exc:
-            print(f"Erreur export : {exc}")
-
-
-def interactive_target():
-    print("\n🎯 CIBLE / DNS")
-    target = input("Domaine ou IP [mtn.ci] : ").strip() or "mtn.ci"
-    resolve_target(target)
-
-
-def interactive_live():
-    print("\n📡 MODE LIVE")
-    print("Backend de capture : dépendant de l'appareil")
-    print("Termux/Android peut nécessiter root ou un mécanisme de capture autorisé.")
-    print("SNIFFER-X-NETWORK ne contourne aucune protection ni permission.")
-    input("Appuie sur Entrée pour revenir au menu...")
-
-
-def interactive_menu():
+def interactive():
     while True:
-        print("\n" + "=" * 56)
-        print("        SNIFFER-X-NETWORK  v0.1")
-        print("      NETWORK DIAGNOSTICS • TERMUX")
-        print("=" * 56)
-        print("[1] 📦 Analyser un fichier PCAP")
-        print("[2] 🎯 Résoudre une cible (DNS/IP)")
-        print("[3] 📡 Vérifier le mode Live")
-        print("[4] ℹ️  Aide")
+        print("\n"+"="*64);print("          SNIFFER-X-NETWORK v0.2");print("       NETWORK • URL • LINK INTELLIGENCE");print("="*64)
+        print("[1] 🔎 Fouiller une cible (DNS/IP)")
+        print("[2] 🌐 Lire les HTTP headers")
+        print("[3] 🔐 Inspecter TLS/HTTPS")
+        print("[4] 🔗 Fouiller les liens d'une page")
+        print("[5] 📦 Analyser un PCAP")
+        print("[6] 📡 Mode Live / capture")
         print("[0] 🚪 Quitter")
-        choice = input("\nChoix > ").strip()
-        if choice == "1":
-            interactive_pcap()
-        elif choice == "2":
-            interactive_target()
-        elif choice == "3":
-            interactive_live()
-        elif choice == "4":
-            print("\nConseil : utilise le menu pour éviter de mémoriser les commandes.")
-            print("Les analyses concernent uniquement des captures et réseaux que tu es autorisé à diagnostiquer.")
-            input("\nAppuie sur Entrée...")
-        elif choice == "0":
-            print("\nSNIFFER-X-NETWORK fermé. 👋")
-            return 0
-        else:
-            print("Choix invalide.")
-    return 0
-
+        try:c=input("\nChoix > ").strip()
+        except (EOFError,KeyboardInterrupt):print();return 0
+        if c=="0":return 0
+        if c in ("1","2","3","4"):
+            t=input("Domaine ou URL > ").strip()
+            if not t:continue
+            if c=="1":resolve_target(t)
+            elif c=="2":http_headers(t)
+            elif c=="3":tls_info(t)
+            else:extract_links(t)
+        elif c=="5":
+            f=input("Fichier PCAP > ").strip()
+            if f:
+                try:
+                    ps=read_pcap(f);print_stats(ps);print("\nPackets:");print_packets(ps)
+                except Exception as e:print("PCAP error:",e)
+        elif c=="6":
+            print("\n📡 Live capture backend: dépendant de l'appareil.")
+            print("Termux/Android peut nécessiter root ou un mécanisme de capture autorisé.")
+        else:print("Choix invalide")
+        input("\nEntrée pour revenir au menu...")
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="sxn", description="SNIFFER-X-NETWORK diagnostics")
-    sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("pcap", help="Analyze an authorized PCAP file")
-    p.add_argument("file")
-    p.add_argument("--protocol", choices=["TCP", "UDP", "ICMP", "IPv6"])
-    p.add_argument("--host")
-    p.add_argument("--port", type=int)
-    p.add_argument("--limit", type=int, default=30)
-    p.add_argument("--json", dest="json_out")
-    p.add_argument("--csv", dest="csv_out")
-    s = sub.add_parser("live", help="Check live-capture requirements")
-    s.add_argument("--interface", default="auto")
-    return parser
-
+    p=argparse.ArgumentParser(prog="sxn",description="SNIFFER-X-NETWORK diagnostics");sub=p.add_subparsers(dest="command",required=True)
+    q=sub.add_parser("pcap");q.add_argument("file");q.add_argument("--protocol",choices=["TCP","UDP","ICMP","IPv6"]);q.add_argument("--host");q.add_argument("--port",type=int);q.add_argument("--limit",type=int,default=30);q.add_argument("--json",dest="json_out");q.add_argument("--csv",dest="csv_out")
+    sub.add_parser("live");return p
 
 def main(argv=None):
-    if argv is None:
-        argv = sys.argv[1:]
-    if not argv:
-        return interactive_menu()
-    args = build_parser().parse_args(argv)
-    if args.command == "live":
-        print("Live capture backend: device-dependent")
-        print("Termux/Android may require root or an authorized capture mechanism.")
-        print("No security controls are bypassed by SNIFFER-X-NETWORK.")
-        return 0
-    try:
-        packets = read_pcap(args.file)
-    except (OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    packets = filter_packets(packets, args.protocol, args.host, args.port)
-    print_stats(packets)
-    print("\nPackets:")
-    print_packets(packets, max(0, args.limit))
-    if args.json_out:
-        export_json(packets, args.json_out)
-    if args.csv_out:
-        export_csv(packets, args.csv_out)
+    if argv is None:argv=sys.argv[1:]
+    if not argv:return interactive()
+    a=build_parser().parse_args(argv)
+    if a.command=="live":print("Live capture backend: device-dependent");return 0
+    try:ps=filter_packets(read_pcap(a.file),a.protocol,a.host,a.port)
+    except (OSError,ValueError) as e:print("error:",e,file=sys.stderr);return 2
+    print_stats(ps);print("\nPackets:");print_packets(ps,max(0,a.limit))
+    if a.json_out:Path(a.json_out).write_text(json.dumps(ps,indent=2),encoding="utf-8")
+    if a.csv_out:
+        with Path(a.csv_out).open("w",newline="",encoding="utf-8") as f:
+            w=csv.DictWriter(f,fieldnames=["src","dst","protocol","src_port","dst_port","length"]);w.writeheader();w.writerows(ps)
     return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__":raise SystemExit(main())
