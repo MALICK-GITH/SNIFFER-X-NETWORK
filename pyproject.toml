@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sniffer-x-network"
+version = "0.1.0"
+description = "Termux-friendly network diagnostics and PCAP analyzer"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "MALICK-GITH"}]
+
+[project.scripts]
+sxn = "sxnetwork:main"
+
+[tool.setuptools]
+py-modules = ["sxnetwork"]
+package-dir = {"" = "src"}
